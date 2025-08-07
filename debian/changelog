@@ -1,5 +1,7 @@
-template-repository (1.0-1) unstable; urgency=medium
+pstack (2.14-1) unstable; urgency=medium
 
-  * Initial release
+  * Non-maintainer upload.
+  * 
 
- -- Tsic404 <liuheng@deepin.org>  Sat, 28 Jan 2023 13:46:49 +0800
+ -- lichenggang <lichenggang@deepin.org>  Thu, 07 Aug 2025 10:26:09 +0800
+

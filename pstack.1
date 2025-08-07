@@ -1,0 +1,116 @@
+.\" $Id: pstack.1,v 1.2 2007/02/28 00:36:13 peadar Exp $
+.\"
+.Dd Mar 29, 2018
+.Dt PSTACK 1
+.Os
+.Sh NAME
+.Nm pstack
+.Nd print stack traces of threads in a running process or a core file
+.Sh SYNOPSIS
+.Nm
+.Op Fl a
+.Op Fl j
+.Op Fl n
+.Op Fl p
+.Op Fl s
+.Op Fl t
+.Op Fl v
+.Op Fl b Ar seconds
+.Op Fl g Ar directory
+.Aq Ar executable | pid | core
+*
+.Nm
+.Fl d Ar elf-file
+.Nm
+.Fl D Ar elf-file
+.Nm
+.Fl V
+.Nm
+.Fl h
+.Sh DESCRIPTION
+Displays the stack traces of each thread in the running process with process
+id
+.Ar pid
+or from the core file
+.Ar core
+.Pp
+Normal invocation prints the stack trace from a core file or running
+process. This implementation understands the stack unwinding data in eh_frame
+sections, and properly unwinds through stack frames of code compiled with
+.Em -fomit-frame-pointer
+and on x86_64
+.Pp
+Arguments are as follows.
+.Bl -tag -width Fl
+.It Fl a
+Show values of arguments passed to functions if possible (requires DWARF debug
+data for function's code). This also works in python mode.
+.It Fl j
+Use JSON format for the stack output
+.It Fl n
+Do not attempt to find external debug information. DWARF debug information
+and symbol tables may be contained in separate ELF objects, as referenced
+by either the .gnu_debuglink or inferred by the GNU "build ID" ELF note.
+.It Fl p
+Attempt to print the stack trace from any discovered python interpreters and
+threads. Works with Python 2 and 3 - support for python 3 may require
+recompilation after upgrading minor versions.
+.It Fl s
+Do not attempt to locate source code information (file and line number) for
+each frame. Finding the source locations may slow down stack tracing.
+.It Fl t
+Do not use the thread_db library to associate userland thread data
+structures with kernel level LWPs. For modern linux systems, LWPs and
+user mode threads are effectively the same thing. At this point the only
+benefit of using this library is to associated pthread IDs with the LWPs.
+.It Fl v
+Produce more verbose diagnostics. Can be repeated to increase verbosity further.
+.It Fl b Ar N
+Poll-mode: repeatedly trace stacks every
+.Ar N
+seconds, until interrupted.
+.It Fl g Ar directory
+Use
+.Ar directory
+as a potential location to find debug ELF images, as referred to by a build-id note
+or gnu_debuglink section. The default directory is
+.Pa /usr/lib/debug
+.It Aq Ar executable | core | pid
+List of core files or PIDs to trace. An executable image specified on
+the command line will override the executable derived from the core
+or processes specified after it until a different executable image
+is provided
+.El
+.Pp
+There are some options to aid debugging issues with ELF and DWARF binaries. Namely
+.Bl -tag -width Fl
+.It Nm Fl D Ar ELF-image
+Format DWARF debugging information of the provided
+.Ar ELF-image
+in JSON
+.It Nm Fl d Ar ELF-image
+Format ELF information of the provided
+.Ar ELF-image
+in JSON
+.It Nm Fl V
+Print git commit-id used to build
+.Nm
+.It Nm Fl h
+Print usage synopsis
+.Nm
+.El
+.Sh SEE ALSO
+.Xr procfs 5
+.Xr ptrace 2
+.Sh TODO
+.Bl -bullet
+.It
+Support rela for object files
+.It
+This actually works on ARM (i.e., raspi), but needs debug_frame. Apparently,
+ARM has its own magical sections for storing unwind information that it might
+be worth implementing.
+.El
+works on x86_64 and i686 only.
+.Sh AUTHORS
+Peter Edwards <peadar (at) isainmdom dot net>

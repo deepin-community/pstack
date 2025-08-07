@@ -1,0 +1,256 @@
+#include "libpstack/elf.h"
+#include "libpstack/dwarf.h"
+
+namespace pstack::Dwarf {
+
+void
+Unit::load()
+{
+    auto &abbrev { dwarf->elf->getDebugSection(".debug_abbrev", SHT_NULL) };
+    DWARFReader abbR(abbrev.io(), abbrevOffset);
+    uintmax_t code;
+    while ((code = abbR.getuleb128()) != 0)
+        abbreviations.emplace(std::piecewise_construct,
+                std::forward_as_tuple(code),
+                std::forward_as_tuple(abbR));
+}
+
+std::string
+Unit::strx(size_t idx) {
+    if (!dwarf->debugStrOffsets)
+        throw (Exception() << "no string offsets table, but have strx form");
+    // Get the root die, and the string offset base.
+    auto offsets_base = root().attribute(DW_AT_str_offsets_base);
+    Elf::Off base = 0;
+    size_t entrysize = 4;
+    if (offsets_base.valid()) {
+       // non-DWO case.
+       base = Elf::Off(uintmax_t(offsets_base));
+       // XXX: this should be from the header, but I can't get to the header
+       // from here. "base" points just after it, but I can't back up over it
+       // without knowing the length encoded at the start of it. So let's just
+       // assume its the same as the unit for now.
+       entrysize = dwarfLen;
+    } else if (version >= 5) {
+       DWARFReader r(dwarf->debugStrOffsets.io());
+       // Version 5 has a header
+       [[maybe_unused]] size_t seclen = 0;
+       std::tie( seclen, entrysize ) = r.getlength();
+       [[maybe_unused]] auto version = r.getu16();
+       [[maybe_unused]] auto padding = r.getu16();
+       base = r.getOffset();
+    }
+    DWARFReader r(dwarf->debugStrOffsets.io(), base + (entrysize * idx));
+    uintmax_t offset = r.getuint(entrysize);
+    return dwarf->debugStrings.io()->readString(offset);
+}
+
+uintmax_t
+Unit::addrx(size_t idx) {
+    if (!dwarf->debugAddr)
+        throw (Exception() << "no debug addr table, but have addrx form");
+    auto base = intmax_t(root().attribute(DW_AT_addr_base));
+    auto addrlen = sizeof(Elf::Addr);
+    if (base > 2) {
+       // the header precedes this, and two bytes back, we get the address size.
+       DWARFReader r(dwarf->debugAddr.io(), base - 2);
+       addrlen = r.getu8();
+    }
+    return dwarf->debugAddr.io()->readObj<Elf::Addr>(base + (idx * addrlen));
+}
+
+uintmax_t
+Unit::rnglistx(size_t slot) {
+
+    DWARFReader r(dwarf->debugRangelists.io(), 0);
+    auto attr = root().attribute(DW_AT_rnglists_base);
+    auto base = attr.valid() ? uintmax_t(attr) : 0;
+
+    // We need to parse the first part of the header to get the size of the
+    // entries in the table.
+    auto [ _, dwarflen ] = r.getlength();
+    /*
+     * We don't need the rest of the fields:
+    auto version = r.getuint(2);
+    auto address_size = r.getuint(1);
+    auto ss_size = r.getuint(1);
+    auto offset_entry_count = r.getuint(4);
+    */
+
+    // seek to the entry at base + slot ...
+    r.setOffset(base + slot * dwarflen);
+
+    // ...then read and add the base.
+    return base + r.getuint(dwarflen);
+}
+
+Unit::Unit(const Info *di, DWARFReader &r)
+    : abbrevOffset{ 0 }
+    , dwarf(di)
+    , unitType(DW_UT_compile)
+    , id{}
+{
+    offset = r.getOffset();
+    std::tie(length, dwarfLen) = r.getlength();
+    end = r.getOffset() + length;
+    version = r.getu16();
+
+    if (version <= 2) // DWARF Version 2 uses the architecture's address size.
+       dwarfLen = ELF_BYTES;
+    if (version >= 5) {
+        unitType = UnitType(r.getu8());
+        switch (unitType) {
+        case DW_UT_compile:
+        case DW_UT_type:
+        case DW_UT_partial:
+            r.addrLen = addrlen = r.getu8();
+            abbrevOffset = r.getuint(dwarfLen);
+            break;
+        case DW_UT_skeleton:
+        case DW_UT_split_compile:
+        case DW_UT_split_type:
+            r.addrLen = addrlen = r.getu8();
+            abbrevOffset = r.getuint(dwarfLen);
+            r.getBytes(sizeof id, &id[0]);
+            break;
+        default:
+            throw (Exception() << "unhandled DW_UT_ unit type value " << unitType);
+        }
+    } else {
+        abbrevOffset = r.getuint(version <= 2 ? 4 : dwarfLen);
+        r.addrLen = addrlen = r.getu8();
+    }
+    rootOffset = r.getOffset();
+    // we now have enough info to parse the abbreviations and the DIE tree.
+}
+
+/*
+ * Convert an offset to a raw DIE.
+ * Offsets are relative to the start of the DWARF info section, *not* the unit.
+ * If the parent is not known, it can be null
+ * If we later need to find the parent, it may require scanning the entire
+ * DIE tree to do so if we don't know parent's offset when requested.
+ */
+
+std::shared_ptr<DIE::Raw>
+Unit::offsetToRawDIE(const DIE &parent, Elf::Off offset) {
+    if (offset == 0 || offset < this->offset || offset >= this->end)
+        return nullptr;
+
+    auto &rawptr = allEntries[offset];
+    if (rawptr == nullptr) {
+        rawptr = DIE::decode(this, parent, offset);
+        // this may still be null, and occupy space in the hash table, but
+        // it's harmless, and cheaper than removing the entry.
+    }
+    return rawptr;
+}
+
+/*
+ * Convert an offset in the dwarf info to a DIE.
+ * If the parent is not known, it can be null
+ * If we later need to find the parent, it may require scanning the entire
+ * DIE tree to do so if we don't know parent's offset when requested.
+ */
+DIE
+Unit::offsetToDIE(const DIE &parent, Elf::Off offset) {
+    if (abbreviations.empty())
+        load();
+    return {shared_from_this(), offset, offsetToRawDIE(parent, offset)};
+}
+
+DIE Unit::root() {
+   return offsetToDIE(DIE(), rootOffset);
+}
+
+std::string
+Unit::name()
+{
+    return root().name();
+}
+
+const Macros *
+Unit::getMacros()
+{
+    if (macros == nullptr) {
+       const DIE &root_ = root();
+       for (auto i : { DW_AT_GNU_macros, DW_AT_macros, DW_AT_macro_info }) {
+          auto a = root_.attribute(i);
+          if (a.valid()) {
+              macros = std::make_unique<Macros>(*dwarf, intmax_t(a), i == DW_AT_macro_info ? 4 : 5);
+              return macros.get();
+          }
+       }
+    }
+    return macros.get();
+}
+
+bool
+Unit::sourceFromAddr(Elf::Addr addr, std::vector<std::pair<std::string, int>> &info) {
+    DIE d = root();
+    if (d.containsAddress(addr) == ContainsAddr::NO)
+        return false;
+    const auto &lines = getLines();
+    if (lines != nullptr) {
+        for (auto i = lines->matrix.begin(); i != lines->matrix.end(); ++i) {
+            if (i->end_sequence)
+                continue;
+            auto next = i+1;
+            if (i->addr <= addr && next->addr > addr) {
+                const std::string &dirname = lines->directories[i->file->dirindex];
+                info.emplace_back(dwarf->elf->context.verbose != 0 ? dirname + "/" + i->file->name : i->file->name, i->line);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+const std::unique_ptr<LineInfo> &
+Unit::getLines()
+{
+    if (lines != nullptr)
+        return lines;
+
+    const auto &r = root();
+    if (r.tag() != DW_TAG_partial_unit && r.tag() != DW_TAG_compile_unit)
+        return lines;
+
+    auto attr = r.attribute(DW_AT_stmt_list);
+    if (!attr.valid())
+        return lines;
+
+    lines = dwarf->linesAt(intmax_t(attr), *this);
+    return lines;
+}
+
+const Abbreviation *
+Unit::findAbbreviation(size_t code) const
+{
+    auto it = abbreviations.find(code);
+    return it != abbreviations.end() ? &it->second : nullptr;
+}
+
+const std::unique_ptr<Ranges> &
+Unit::getRanges(const DIE &die, uintmax_t base) {
+    if (base == 0) {
+       const DIE::Attribute & low = root().attribute(DW_AT_low_pc);
+       if (low.valid())
+          base = uintmax_t(low);
+
+    }
+    auto &ptr = rangesForOffset[die.offset];
+    if (ptr == nullptr)
+        ptr = std::make_unique<Ranges>(die, base);
+    return ptr;
+}
+
+void
+Unit::purge()
+{
+    allEntries = AllEntries();
+    rangesForOffset = decltype(rangesForOffset)();
+    macros.reset(nullptr);
+}
+
+}
